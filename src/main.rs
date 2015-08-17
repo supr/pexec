@@ -4,6 +4,9 @@ use std::path::Path;
 use std::sync::{mpsc,Arc,Mutex};
 use std::error::Error;
 use std::thread;
+use std::net::TcpStream;
+use std::io::{stdin, stdout, BufRead, Read, Write};
+use std::fs::File;
 
 extern crate getopts;
 use getopts::Options;
@@ -11,6 +14,11 @@ use getopts::Options;
 extern crate csv;
 extern crate rustc_serialize;
 extern crate num_cpus;
+extern crate rpassword;
+
+extern crate ssh2;
+use ssh2::Error as SshError;
+use ssh2::Session;
 
 #[derive(RustcDecodable, Debug)]
 struct HostRecord {
@@ -48,6 +56,52 @@ fn parse_csv_records<P: AsRef<Path>>(csv_file: P, tx: mpsc::Sender<HostRecord>) 
     });
 }
 
+fn prompt_password_for(remote_user: &str) -> String {
+    let stdout = stdout();
+    print!("Enter Password for {}: ", remote_user);
+    stdout.lock().flush();
+
+    return rpassword::read_password().unwrap();
+}
+
+fn pexec(remote_user: &str, password: &str, record: &HostRecord) {
+    let tcp_result = TcpStream::connect(format!("{}:{}", record.hostname, record.port.unwrap_or(22)).trim());
+    if let Err(e) = tcp_result {
+        println!("ERROR: ({}) {:?}", record.hostname, e.description());
+        return;
+    }
+
+    let tcp = tcp_result.unwrap();
+    let mut sess = Session::new().unwrap();
+    match sess.handshake(&tcp) {
+        Err(e) => { println!("ERROR: ({}) {}", record.hostname, e.description()); return; },
+        _ => { (); }
+    }
+
+    match sess.userauth_password(remote_user, password) {
+        Err(e) => { println!("ERROR: ({}) {}", record.hostname, e.description()); return; },
+        _ => { (); }
+    }
+
+    let mut channel = sess.channel_session().unwrap();
+    channel.request_pty("xterm", Some(""), Some((80u32, 24u32, 80u32, 24u32)));
+
+    if let Err(e) = channel.exec(&*format!("echo -e '{}\n' | sudo -p '' -S cat {}", password, record.remote_path)) {
+        println!("ERROR: {}", e.description());
+        return;
+    } else {
+        let local_path = Path::new(&(record.local_path));
+        match File::create(&local_path) {
+            Err(why) => { println!("ERROR: {} {}", record.local_path, why.description()); return; },
+            Ok(mut file) => { 
+                let mut s = String::new();
+                channel.read_to_string(&mut s).unwrap();
+                file.write_all(s.as_bytes());
+            },
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     let program = args[0].clone();
@@ -77,9 +131,12 @@ fn main() {
     let ncpus = num_cpus::get();
 
     let mut children = Vec::with_capacity(ncpus);
+    let password = prompt_password_for(remote_user.trim());
 
     for i in 0..ncpus {
         let data = data.clone();
+        let remote_user = remote_user.clone();
+        let password = password.clone();
         let child = thread::spawn(move || {
             loop {
                 let guard = data.lock().unwrap();
@@ -91,8 +148,7 @@ fn main() {
                         _ => { continue; }
                     }
                 }
-
-                println!("{:?}", record_result.unwrap());
+                pexec(remote_user.trim(), password.trim(), &(record_result.unwrap()));
             }
         });
 
